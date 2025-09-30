@@ -1,0 +1,286 @@
+(function () {
+  "use strict";
+
+  // ==============================
+  // CONFIGURATION
+  // ==============================
+  const CONFIG = {
+    DELETE: 2000,
+    MAX_RETRIES: 3,
+    SCROLL_AMOUNT: 300,
+    CONTEXT_MENU_TIMEOUT_MS: 5000,
+    // Le conteneur de la conversation possède role="log"
+    SCROLL_CONTAINER_SELECTOR: "div[role='log']"
+  };
+
+  // ==============================
+  // STATE
+  // ==============================
+  const state = {
+    processedMessages: new Set(),
+    queue: [],
+    retryMap: new Map(),
+    isProcessing: false,
+    totalProcessed: 0,
+    totalDeleted: 0
+  };
+
+  // ==============================
+  // STYLES
+  // ==============================
+  const STYLES = {
+    PROCESSING: "4px solid #007acc",
+    DELETED: "4px solid #28a745",
+    FAILED: "4px dashed #dc3545",
+    RETRY: "4px solid #ffc107",
+    SKIPPED: "4px solid #6c757d",
+    ALREADY_DELETED: "4px solid #fd7e14"
+  };
+
+  console.log("[Teams Delete Script] Starting enhanced version...");
+  console.log("Configuration:", CONFIG);
+
+  // ------------------------------
+  // UTILITIES
+  // ------------------------------
+  const simulateMouseEvent = (type, el) => {
+    if (!el) throw new Error(`Cannot simulate ${type} on null`);
+    const ev = new MouseEvent(type, {
+      view: window,
+      bubbles: true,
+      cancelable: true,
+      buttons: 1
+    });
+    el.dispatchEvent(ev);
+  };
+
+  const applyVisualFeedback = (el, status, msg = "") => {
+    if (!el) return;
+    el.style.outline = STYLES[status] || STYLES.PROCESSING;
+    el.style.transition = "outline .3s ease";
+
+    if (status === "PROCESSING") {
+      el.style.animation = "pulse 1s ease-in-out infinite alternate";
+      if (!document.getElementById("teams-delete-styles")) {
+        const style = document.createElement("style");
+        style.id = "teams-delete-styles";
+        style.textContent = `
+          @keyframes pulse {0%{outline-color:#007acc}100%{outline-color:#005a9e}}
+        `;
+        document.head.appendChild(style);
+      }
+    } else {
+      el.style.animation = "";
+    }
+
+    if (msg) console.log(`[Visual] ${msg}`);
+  };
+
+  const scrollToLoadMessages = () => {
+    const container = document.querySelector(CONFIG.SCROLL_CONTAINER_SELECTOR);
+    if (!container) {
+      console.warn("[Scroll] Container not found");
+      return;
+    }
+    const before = container.scrollTop;
+    container.scrollBy({ top: -CONFIG.SCROLL_AMOUNT, behavior: "auto" });
+    setTimeout(() => {
+      if (container.scrollTop === 0 && before === 0) {
+        console.log("[Scroll] Top of conversation reached");
+      }
+    }, 100);
+  };
+
+  // ------------------------------
+  // CORE LOGIC
+  // ------------------------------
+
+  /** Retourne l’élément qui représente visuellement la bulle */
+  const getMessageBubble = (msgEl) => {
+    return msgEl.querySelector(".message-body, .chat-message") || msgEl;
+  };
+
+  /** Recherche le bouton “Delete” dans le menu contextuel */
+  const findDeleteOption = () => {
+    // 1 aria‑label (anglais / français)
+    const byAria = document.querySelector('[aria-label*="Delete"], [aria-label*="Supprimer"]');
+    if (byAria) return byAria;
+
+    // fallback
+    const byTid = document.querySelector('[data-tid="deleteMessage"]');
+    if (byTid) return byTid;
+
+    // 2️ Bouton contenant une icône de corbeille
+    const trashBtn = Array.from(document.querySelectorAll('button, div')).find(el => {
+      const txt = el.textContent.trim().toLowerCase();
+      const hasIcon = !!el.querySelector('svg[data-icon="Delete"], svg[data-icon="Trash"]');
+      return (txt === "delete" || txt === "supprimer" || txt === "delete message") || hasIcon;
+    });
+    if (trashBtn) return trashBtn;
+
+    // 3️ Recherche générique par texte
+    const candidates = Array.from(document.querySelectorAll('button, div')).filter(el => {
+      const txt = el.textContent.trim().toLowerCase();
+      return txt === "delete" || txt === "supprimer" || txt === "delete message";
+    });
+    return candidates[0];
+  };
+
+  /** Traitement d’un seul message */
+  const processMessage = async (msgEl) => {
+    if (!msgEl) return;
+
+    const id = msgEl.getAttribute("data-mid");
+    if (!id) {
+      console.warn("[Process] No data-mid, skipping");
+      return;
+    }
+
+    if (state.processedMessages.has(id)) return;
+
+    state.totalProcessed++;
+    const bubble = getMessageBubble(msgEl);
+    applyVisualFeedback(bubble, "PROCESSING");
+
+    const isMine = Array.from(msgEl.classList).some(c => c.includes("ChatMyMessage"));
+    const preview = bubble.innerText?.trim().substring(0, 30) ?? "(no content)";
+    console.log(`[Process] #${state.totalProcessed} – ID:${id} – "${preview}" – Mine:${isMine}`);
+
+    if (!isMine) {
+      state.processedMessages.add(id);
+      applyVisualFeedback(bubble, "SKIPPED", "Not my message");
+      return;
+    }
+
+    // Déjà supprimé ?
+    if (msgEl.querySelector("[data-tid=message-undo-delete-btn]")) {
+      state.processedMessages.add(id);
+      applyVisualFeedback(bubble, "ALREADY_DELETED", "Already deleted");
+      return;
+    }
+
+    try {
+      // ----- Ouvrir le menu contextuel -----
+      simulateMouseEvent("mousedown", bubble);
+      simulateMouseEvent("mouseup", bubble);
+      simulateMouseEvent("contextmenu", bubble);
+
+      // ----- Attendre le bouton Delete -----
+      const deleteBtn = await new Promise((resolve, reject) => {
+        const start = Date.now();
+        const int = setInterval(() => {
+          if (Date.now() - start > CONFIG.CONTEXT_MENU_TIMEOUT_MS) {
+            clearInterval(int);
+            reject(new Error("Delete option timeout"));
+            return;
+          }
+          const opt = findDeleteOption();
+          if (opt) {
+            clearInterval(int);
+            resolve(opt);
+          }
+        }, 100);
+      });
+
+            // ----- Cliquer sur Delete -----
+      simulateMouseEvent("click", deleteBtn);
+      console.log(`[Process] Deleted ID:${id}`);
+
+      // Marquer comme traité
+      state.processedMessages.add(id);
+      state.totalDeleted++;
+      applyVisualFeedback(bubble, "DELETED", "Deleted");
+    } catch (e) {
+      // ----- Gestion des erreurs / retries -----
+      console.error(`[Process] Error ID:${id} – ${e.message}`);
+
+      const attempts = state.retryMap.get(id) || 0;
+      if (attempts < CONFIG.MAX_RETRIES) {
+        // Ré‑enfiler pour réessayer
+        state.retryMap.set(id, attempts + 1);
+        state.queue.push(msgEl);
+        applyVisualFeedback(bubble, "RETRY", `Retry ${attempts + 1}/${CONFIG.MAX_RETRIES}`);
+      } else {
+        // Échec définitif
+        console.warn(`[Process] ❌ Permanently failed ID:${id} after ${CONFIG.MAX_RETRIES} attempts`);
+        state.processedMessages.add(id);
+        applyVisualFeedback(bubble, "FAILED", "Failed");
+      }
+    }
+
+    // Log de progression toutes les 10 messages
+    if (state.totalProcessed % 10 === 0) {
+      console.log(`[Progress] Processed:${state.totalProcessed} | Deleted:${state.totalDeleted} | Queued:${state.queue.length}`);
+    }
+
+    // Respect du délai configuré entre deux suppressions
+    await new Promise(r => setTimeout(r, CONFIG.DELETE));
+  };
+
+  /** Parcourt le DOM à la recherche de nouveaux messages non encore en file */
+  const scanMessages = () => {
+    const msgs = Array.from(document.querySelectorAll("div[data-mid]"))
+      .reverse()
+      .filter(m => {
+        const id = m.getAttribute("data-mid");
+        return id && !state.processedMessages.has(id) && !state.queue.includes(m);
+      });
+
+    if (msgs.length) {
+      console.log(`[Scan] Found ${msgs.length} new message(s)`);
+      state.queue.push(...msgs);
+    }
+  };
+
+  /** Traite la file d’attente de façon séquentielle */
+  const processQueue = async () => {
+    if (state.isProcessing) return;
+    state.isProcessing = true;
+
+    try {
+      while (state.queue.length) {
+        const msg = state.queue.shift();
+        await processMessage(msg);
+      }
+
+      // Quand la file est vide, on charge plus de messages en remontant
+      console.log("[Queue] Empty – scrolling for older messages");
+      scrollToLoadMessages();
+      scanMessages(); // peut ajouter de nouveaux éléments après le scroll
+    } catch (err) {
+      console.error("[Queue] Unexpected error:", err);
+    } finally {
+      state.isProcessing = false;
+    }
+  };
+
+  // ------------------------------
+  // INITIALISATION
+  // ------------------------------
+  const startScript = () => {
+    console.log("[Init] Starting Teams deletion script");
+
+    // Observer les mutations du DOM (nouveaux messages, menus contextuels, etc.)
+    const observer = new MutationObserver(() => {
+      scanMessages();
+      if (!state.isProcessing) processQueue();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Passage initial
+    scanMessages();
+    processQueue();
+
+    // Vérification périodique au cas où aucune mutation ne se produit
+    setInterval(() => {
+      if (!state.isProcessing && state.queue.length === 0) {
+        console.log("[Timer] Auto‑scroll check");
+        scrollToLoadMessages();
+      }
+    }, 5000);
+  };
+
+  // Lancer le script
+  startScript();
+
+})();
